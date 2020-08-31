@@ -32,7 +32,7 @@ import { Constants } from "./constants/Constants";
 import { Messages } from "./constants/Messages";
 import BaseScrollComponent from "./scrollcomponent/BaseScrollComponent";
 import BaseScrollView, { ScrollEvent, ScrollViewDefaultProps } from "./scrollcomponent/BaseScrollView";
-import { TOnItemStatusChanged } from "./ViewabilityTracker";
+import { TOnItemStatusChanged, WindowCorrection } from "./ViewabilityTracker";
 import VirtualRenderer, { RenderStack, RenderStackItem, RenderStackParams } from "./VirtualRenderer";
 import ItemAnimator, { BaseItemAnimator } from "./ItemAnimator";
 import { DebugHandlers } from "..";
@@ -91,11 +91,11 @@ export interface RecyclerListViewProps {
     onVisibleIndicesChanged?: TOnItemStatusChanged;
     renderFooter?: () => JSX.Element | JSX.Element[] | null;
     externalScrollView?: { new(props: ScrollViewDefaultProps): BaseScrollView };
+    layoutSize?: Dimension;
     initialOffset?: number;
     initialRenderIndex?: number;
     scrollThrottle?: number;
     canChangeSize?: boolean;
-    distanceFromWindow?: number;
     useWindowScroll?: boolean;
     disableRecycling?: boolean;
     forceNonDeterministicRendering?: boolean;
@@ -104,10 +104,12 @@ export interface RecyclerListViewProps {
     optimizeForInsertDeleteAnimations?: boolean;
     style?: object | number;
     debugHandlers?: DebugHandlers;
-
+    renderContentContainer?: (props?: object, children?: React.ReactNode) => React.ReactNode | null;
     //For all props that need to be proxied to inner/external scrollview. Put them in an object and they'll be spread
     //and passed down. For better typescript support.
     scrollViewProps?: object;
+    applyWindowCorrection?: (offsetX: number, offsetY: number, windowCorrection: WindowCorrection) => void;
+    onItemLayout?: (index: number) => void;
 }
 
 export interface RecyclerListViewState {
@@ -123,7 +125,6 @@ export default class RecyclerListView<P extends RecyclerListViewProps, S extends
         initialRenderIndex: 0,
         isHorizontal: false,
         onEndReachedThreshold: 0,
-        distanceFromWindow: 0,
         renderAheadOffset: IS_WEB ? 1000 : 250,
     };
 
@@ -150,8 +151,12 @@ export default class RecyclerListView<P extends RecyclerListViewProps, S extends
     private _initialOffset = 0;
     private _cachedLayouts?: Layout[];
     private _scrollComponent: BaseScrollComponent | null = null;
+    private _windowCorrection: WindowCorrection;
 
-    private _defaultItemAnimator: ItemAnimator = new DefaultItemAnimator();
+    //If the native content container is used, then positions of the list items are changed on the native side. The animated library used
+    //by the default item animator also changes the same positions which could lead to inconsistency. Hence, the base item animator which
+    //does not perform any such animations will be used.
+    private _defaultItemAnimator: ItemAnimator = new BaseItemAnimator();
 
     constructor(props: P, context?: any) {
         super(props, context);
@@ -161,10 +166,21 @@ export default class RecyclerListView<P extends RecyclerListViewProps, S extends
             return this.props.dataProvider.getStableId(index);
         }, !props.disableRecycling);
 
-        this.state = {
-            internalSnapshot: {},
-            renderStack: {},
-        } as S;
+        this._windowCorrection = {
+            startCorrection: 0, endCorrection: 0, windowShift: 0,
+        };
+        this._getContextFromContextProvider(props);
+        if (props.layoutSize) {
+            this._layout.height = props.layoutSize.height;
+            this._layout.width = props.layoutSize.width;
+            this._initComplete = true;
+            this._initTrackers(props);
+        } else {
+            this.state = {
+                internalSnapshot: {},
+                renderStack: {},
+            } as S;
+        }
     }
 
     public componentWillReceivePropsCompat(newProps: RecyclerListViewProps): void {
@@ -182,22 +198,18 @@ export default class RecyclerListView<P extends RecyclerListViewProps, S extends
     }
 
     public componentDidUpdate(): void {
-        if (this._pendingScrollToOffset) {
-            const offset = this._pendingScrollToOffset;
-            this._pendingScrollToOffset = null;
-            if (this.props.isHorizontal) {
-                offset.y = 0;
-            } else {
-                offset.x = 0;
-            }
-            setTimeout(() => {
-                this.scrollToOffset(offset.x, offset.y, false);
-            }, 0);
-        }
+        this._processInitialOffset();
         this._processOnEndReached();
         this._checkAndChangeLayouts(this.props);
         if (this.props.dataProvider.getSize() === 0) {
             console.warn(Messages.WARN_NO_DATA); //tslint:disable-line
+        }
+    }
+
+    public componentDidMount(): void {
+        if (this._initComplete) {
+            this._processInitialOffset();
+            this._processOnEndReached();
         }
     }
 
@@ -214,29 +226,6 @@ export default class RecyclerListView<P extends RecyclerListViewProps, S extends
                             this.props.contextProvider.save(uniqueKey + Constants.CONTEXT_PROVIDER_LAYOUT_KEY_SUFFIX,
                                 JSON.stringify({ layoutArray: layoutsToCache }));
                         }
-                    }
-                }
-            }
-        }
-    }
-
-    public componentWillMountCompat(): void {
-        if (this.props.contextProvider) {
-            const uniqueKey = this.props.contextProvider.getUniqueKey();
-            if (uniqueKey) {
-                const offset = this.props.contextProvider.get(uniqueKey + Constants.CONTEXT_PROVIDER_OFFSET_KEY_SUFFIX);
-                if (typeof offset === "number" && offset > 0) {
-                    this._initialOffset = offset;
-                    if (this.props.onRecreate) {
-                        this.props.onRecreate({ lastOffset: this._initialOffset });
-                    }
-                    this.props.contextProvider.remove(uniqueKey + Constants.CONTEXT_PROVIDER_OFFSET_KEY_SUFFIX);
-                }
-                if (this.props.forceNonDeterministicRendering) {
-                    const cachedLayouts = this.props.contextProvider.get(uniqueKey + Constants.CONTEXT_PROVIDER_LAYOUT_KEY_SUFFIX) as string;
-                    if (cachedLayouts && typeof cachedLayouts === "string") {
-                        this._cachedLayouts = JSON.parse(cachedLayouts).layoutArray;
-                        this.props.contextProvider.remove(uniqueKey + Constants.CONTEXT_PROVIDER_LAYOUT_KEY_SUFFIX);
                     }
                 }
             }
@@ -363,7 +352,8 @@ export default class RecyclerListView<P extends RecyclerListViewProps, S extends
                 onScroll={this._onScroll}
                 onSizeChanged={this._onSizeChanged}
                 contentHeight={this._initComplete ? this._virtualRenderer.getLayoutDimension().height : 0}
-                contentWidth={this._initComplete ? this._virtualRenderer.getLayoutDimension().width : 0}>
+                contentWidth={this._initComplete ? this._virtualRenderer.getLayoutDimension().width : 0}
+                renderAheadOffset={this.getCurrentRenderAheadOffset()}>
                 {this._generateRenderStack()}
             </ScrollComponent>
         );
@@ -371,6 +361,44 @@ export default class RecyclerListView<P extends RecyclerListViewProps, S extends
 
     protected getVirtualRenderer(): VirtualRenderer {
         return this._virtualRenderer;
+    }
+
+    private _processInitialOffset(): void {
+        if (this._pendingScrollToOffset) {
+            const offset = this._pendingScrollToOffset;
+            this._pendingScrollToOffset = null;
+            if (this.props.isHorizontal) {
+                offset.y = 0;
+            } else {
+                offset.x = 0;
+            }
+            setTimeout(() => {
+                this.scrollToOffset(offset.x, offset.y, false);
+            }, 0);
+        }
+    }
+
+    private _getContextFromContextProvider(props: RecyclerListViewProps): void {
+        if (props.contextProvider) {
+            const uniqueKey = props.contextProvider.getUniqueKey();
+            if (uniqueKey) {
+                const offset = props.contextProvider.get(uniqueKey + Constants.CONTEXT_PROVIDER_OFFSET_KEY_SUFFIX);
+                if (typeof offset === "number" && offset > 0) {
+                    this._initialOffset = offset;
+                    if (props.onRecreate) {
+                        props.onRecreate({ lastOffset: this._initialOffset });
+                    }
+                    props.contextProvider.remove(uniqueKey + Constants.CONTEXT_PROVIDER_OFFSET_KEY_SUFFIX);
+                }
+                if (props.forceNonDeterministicRendering) {
+                    const cachedLayouts = props.contextProvider.get(uniqueKey + Constants.CONTEXT_PROVIDER_LAYOUT_KEY_SUFFIX) as string;
+                    if (cachedLayouts && typeof cachedLayouts === "string") {
+                        this._cachedLayouts = JSON.parse(cachedLayouts).layoutArray;
+                        props.contextProvider.remove(uniqueKey + Constants.CONTEXT_PROVIDER_LAYOUT_KEY_SUFFIX);
+                    }
+                }
+            }
+        }
     }
 
     private _checkAndChangeLayouts(newProps: RecyclerListViewProps, forceFullRender?: boolean): void {
@@ -381,7 +409,7 @@ export default class RecyclerListView<P extends RecyclerListViewProps, S extends
         if (newProps.dataProvider.hasStableIds() && this.props.dataProvider !== newProps.dataProvider && newProps.dataProvider.requiresDataChangeHandling()) {
             this._virtualRenderer.handleDataSetChange(newProps.dataProvider, this.props.optimizeForInsertDeleteAnimations);
         }
-        if (forceFullRender || this.props.layoutProvider !== newProps.layoutProvider || this.props.isHorizontal !== newProps.isHorizontal) {
+        if (this.props.layoutProvider !== newProps.layoutProvider || this.props.isHorizontal !== newProps.isHorizontal) {
             //TODO:Talha use old layout manager
             this._virtualRenderer.setLayoutManager(newProps.layoutProvider.newLayoutManager(this._layout, newProps.isHorizontal));
             if (newProps.layoutProvider.shouldRefreshWithAnchoring) {
@@ -398,6 +426,13 @@ export default class RecyclerListView<P extends RecyclerListViewProps, S extends
             if (layoutManager) {
                 layoutManager.relayoutFromIndex(newProps.dataProvider.getFirstIndexToProcessInternal(), newProps.dataProvider.getSize());
                 this._virtualRenderer.refresh();
+            }
+        } else if (forceFullRender) {
+            const layoutManager = this._virtualRenderer.getLayoutManager();
+            if (layoutManager) {
+                const cachedLayouts = layoutManager.getLayouts();
+                this._virtualRenderer.setLayoutManager(newProps.layoutProvider.newLayoutManager(this._layout, newProps.isHorizontal, cachedLayouts));
+                this._refreshViewability();
             }
         } else if (this._relayoutReqIndex >= 0) {
             const layoutManager = this._virtualRenderer.getLayoutManager();
@@ -425,6 +460,9 @@ export default class RecyclerListView<P extends RecyclerListViewProps, S extends
     }
 
     private _onSizeChanged = (layout: Dimension): void => {
+        if (!this.props.canChangeSize && this.props.layoutSize) {
+            return;
+        }
         const hasHeightChanged = this._layout.height !== layout.height;
         const hasWidthChanged = this._layout.width !== layout.width;
         this._layout.height = layout.height;
@@ -434,7 +472,7 @@ export default class RecyclerListView<P extends RecyclerListViewProps, S extends
         }
         if (!this._initComplete) {
             this._initComplete = true;
-            this._initTrackers();
+            this._initTrackers(this.props);
             this._processOnEndReached();
         } else {
             if ((hasHeightChanged && hasWidthChanged) ||
@@ -447,41 +485,60 @@ export default class RecyclerListView<P extends RecyclerListViewProps, S extends
         }
     }
 
-    private _renderStackWhenReady = (stack: RenderStack): void => {
-        this.setState(() => {
-            return { renderStack: stack };
-        });
+    private _initStateIfRequired(stack?: RenderStack): boolean {
+        if (!this.state) {
+            this.state = {
+                internalSnapshot: {},
+                renderStack: stack,
+            } as S;
+            return true;
+        }
+        return false;
     }
 
-    private _initTrackers(): void {
-        this._assertDependencyPresence(this.props);
-        if (this.props.onVisibleIndexesChanged) {
+    private _renderStackWhenReady = (stack: RenderStack): void => {
+        if (!this._initStateIfRequired(stack)) {
+            this.setState(() => {
+                return { renderStack: stack };
+            });
+        }
+    }
+
+    private _initTrackers(props: RecyclerListViewProps): void {
+        this._assertDependencyPresence(props);
+        if (props.onVisibleIndexesChanged) {
             throw new CustomError(RecyclerListViewExceptions.usingOldVisibleIndexesChangedParam);
         }
-        if (this.props.onVisibleIndicesChanged) {
-            this._virtualRenderer.attachVisibleItemsListener(this.props.onVisibleIndicesChanged!);
+        if (props.onVisibleIndicesChanged) {
+            this._virtualRenderer.attachVisibleItemsListener(props.onVisibleIndicesChanged!);
         }
         this._params = {
-            initialOffset: this._initialOffset ? this._initialOffset : this.props.initialOffset,
-            initialRenderIndex: this.props.initialRenderIndex,
-            isHorizontal: this.props.isHorizontal,
-            itemCount: this.props.dataProvider.getSize(),
-            renderAheadOffset: this.props.renderAheadOffset,
+            initialOffset: this._initialOffset ? this._initialOffset : props.initialOffset,
+            initialRenderIndex: props.initialRenderIndex,
+            isHorizontal: props.isHorizontal,
+            itemCount: props.dataProvider.getSize(),
+            renderAheadOffset: props.renderAheadOffset,
         };
         this._virtualRenderer.setParamsAndDimensions(this._params, this._layout);
-        const layoutManager = this.props.layoutProvider.newLayoutManager(this._layout, this.props.isHorizontal, this._cachedLayouts);
+        const layoutManager = props.layoutProvider.newLayoutManager(this._layout, props.isHorizontal, this._cachedLayouts);
         this._virtualRenderer.setLayoutManager(layoutManager);
-        this._virtualRenderer.setLayoutProvider(this.props.layoutProvider);
+        this._virtualRenderer.setLayoutProvider(props.layoutProvider);
         this._virtualRenderer.init();
         const offset = this._virtualRenderer.getInitialOffset();
         const contentDimension = layoutManager.getContentDimension();
         if ((offset.y > 0 && contentDimension.height > this._layout.height) ||
             (offset.x > 0 && contentDimension.width > this._layout.width)) {
             this._pendingScrollToOffset = offset;
-            this.setState({});
+            if (!this._initStateIfRequired()) {
+                this.setState({});
+            }
         } else {
-            this._virtualRenderer.startViewabilityTracker();
+            this._virtualRenderer.startViewabilityTracker(this._getWindowCorrection(offset.x, offset.y, props));
         }
+    }
+
+    private _getWindowCorrection(offsetX: number, offsetY: number, props: RecyclerListViewProps): WindowCorrection {
+        return (props.applyWindowCorrection && props.applyWindowCorrection(offsetX, offsetY, this._windowCorrection)) || this._windowCorrection;
     }
 
     private _assertDependencyPresence(props: RecyclerListViewProps): void {
@@ -530,7 +587,8 @@ export default class RecyclerListView<P extends RecyclerListViewProps, S extends
                     width={itemRect.width}
                     itemAnimator={Default.value<ItemAnimator>(this.props.itemAnimator, this._defaultItemAnimator)}
                     extendedState={this.props.extendedState}
-                    internalSnapshot={this.state.internalSnapshot} />
+                    internalSnapshot={this.state.internalSnapshot}
+                    onItemLayout={this.props.onItemLayout}/>
             );
         }
         return null;
@@ -579,8 +637,9 @@ export default class RecyclerListView<P extends RecyclerListViewProps, S extends
     }
 
     private _onScroll = (offsetX: number, offsetY: number, rawEvent: ScrollEvent): void => {
-        //Adjusting offsets using distanceFromWindow
-        this._virtualRenderer.updateOffset(offsetX, offsetY, -this.props.distanceFromWindow!, true);
+        // correction to be positive to shift offset upwards; negative to push offset downwards.
+        // extracting the correction value from logical offset and updating offset of virtual renderer.
+        this._virtualRenderer.updateOffset(offsetX, offsetY, true, this._getWindowCorrection(offsetX, offsetY, this.props));
 
         if (this.props.onScroll) {
             this.props.onScroll(rawEvent, offsetX, offsetY);
@@ -662,18 +721,17 @@ RecyclerListView.propTypes = {
     //Specify the initial item index you want rendering to start from. Preferred over initialOffset if both are specified.
     initialRenderIndex: PropTypes.number,
 
+    //Specify the estimated size of the recyclerlistview to render the list items in the first pass. If provided, recyclerlistview will
+    //use these dimensions to fill in the items in the first render. If not provided, recyclerlistview will first render with no items
+    //and then fill in the items based on the size given by its onLayout event. canChangeSize can be set to true to relayout items when
+    //the size changes.
+    layoutSize: PropTypes.object,
+
     //iOS only. Scroll throttle duration.
     scrollThrottle: PropTypes.number,
 
     //Specify if size can change, listview will automatically relayout items. For web, works only with useWindowScroll = true
     canChangeSize: PropTypes.bool,
-
-    //Specify how far away the first list item is from start of the RecyclerListView. e.g, if you have content padding on top or left.
-    //This is an adjustment for optimization and to make sure onVisibileIndexesChanged callback is correct.
-    //Ideally try to avoid setting large padding values on RLV content. If you have to please correct offsets reported, handle
-    //them in a custom ScrollView and pass it as an externalScrollView. If you want this to be accounted in scrollToOffset please
-    //override the method and handle manually.
-    distanceFromWindow: PropTypes.number,
 
     //Web only. Layout elements in window instead of a scrollable div.
     useWindowScroll: PropTypes.bool,
@@ -698,6 +756,12 @@ RecyclerListView.propTypes = {
     //animations are JS driven to avoid workflow interference. Also, please note LayoutAnimation is buggy on Android.
     itemAnimator: PropTypes.instanceOf(BaseItemAnimator),
 
+    //The Recyclerlistview item cells are enclosed inside this item container. The idea is pass a native UI component which implements a
+    //view shifting algorithm to remove the overlaps between the neighbouring views. This is achieved by shifting them by the appropriate
+    //amount in the correct direction if the estimated sizes of the item cells are not accurate. If this props is passed, it will be used to
+    //enclose the list items and otherwise a default react native View will be used for the same.
+    renderContentContainer: PropTypes.func,
+
     //Enables you to utilize layout animations better by unmounting removed items. Please note, this might increase unmounts
     //on large data changes.
     optimizeForInsertDeleteAnimations: PropTypes.bool,
@@ -711,4 +775,14 @@ RecyclerListView.propTypes = {
     //For all props that need to be proxied to inner/external scrollview. Put them in an object and they'll be spread
     //and passed down.
     scrollViewProps: PropTypes.object,
+
+    // Used when the logical offsetY differs from actual offsetY of recyclerlistview, could be because some other component is overlaying the recyclerlistview.
+    // For e.x. toolbar within CoordinatorLayout are overlapping the recyclerlistview.
+    // This method exposes the windowCorrection object of RecyclerListView, user can modify the values in realtime.
+    applyWindowCorrection: PropTypes.func,
+
+    // This can be used to hook an itemLayoutListener to listen to which item at what index is layout.
+    // To get the layout params of the item, you can use the ref to call method getLayout(index), e.x. : `this._recyclerRef.getLayout(index)`
+    // but there is a catch here, since there might be a pending relayout due to which the queried layout might not be precise.
+    onItemLayout: PropTypes.func,
 };
